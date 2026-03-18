@@ -1,8 +1,11 @@
 import asyncio
+import json
 import logging
 import math
 import os
 import random
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,7 +25,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
-app = FastAPI(title="EcoVital AI Local API")
+app = FastAPI(title="EcoVital AI Local API", version="1.1.0")
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(
@@ -68,6 +71,9 @@ risk_history: defaultdict[str, list[dict]] = defaultdict(list)
 community_reports: list[dict] = []
 anthropic_client: AsyncAnthropic | None = None
 anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+gemini_enabled = False
+gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
+gemini_api_key = ""
 logger = logging.getLogger("ecovital.local")
 
 
@@ -283,6 +289,104 @@ async def _ai_risk_explanation(
     return None
 
 
+_GEMINI_FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
+
+
+def _gemini_call(model: str, system: str, prompt: str) -> str:
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={gemini_api_key}"
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 260},
+    }
+    req = urllib.request.Request(
+        url=url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=8) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    candidates = body.get("candidates") or []
+    if not candidates:
+        return ""
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    return "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+
+
+def _gemini_generate_sync(system: str, prompt: str) -> str:
+    if not gemini_enabled or not gemini_api_key:
+        return ""
+    models_to_try = [gemini_model] + _GEMINI_FALLBACK_MODELS
+    last_err = None
+    for model in models_to_try:
+        try:
+            text = _gemini_call(model, system, prompt)
+            if text:
+                return text
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="ignore")
+            if exc.code == 429:
+                logger.warning("Gemini %s rate-limited, trying next model…", model)
+                last_err = RuntimeError(f"Gemini HTTP 429 on {model}")
+                import time
+                time.sleep(1)
+                continue
+            last_err = RuntimeError(f"Gemini HTTP {exc.code} on {model}: {error_body}")
+            continue
+        except urllib.error.URLError as exc:
+            last_err = RuntimeError(f"Gemini network error: {exc.reason}")
+            break
+    if last_err:
+        raise last_err
+    return ""
+
+
+async def _gemini_generate(system: str, prompt: str) -> str | None:
+    if not gemini_enabled:
+        return None
+    try:
+        text = await asyncio.to_thread(_gemini_generate_sync, system, prompt)
+        return text or None
+    except Exception as exc:
+        logger.warning("Gemini generation fallback: %s", exc)
+        return None
+
+
+async def _ai_risk_explanation_with_fallback(
+    message: str,
+    profile: Profile,
+    prediction: RiskPrediction,
+    location_aqi: dict,
+) -> str | None:
+    anthropic_text = await _ai_risk_explanation(message, profile, prediction, location_aqi)
+    if anthropic_text:
+        logger.info("Risk explanation provider: anthropic")
+        return anthropic_text
+
+    system = (
+        "You are EcoVital AI, a preventive health advisor. "
+        "Provide concise, practical, and question-specific guidance in 2-4 sentences. "
+        "Mention the dominant risk reason and one immediate action."
+    )
+    prompt = (
+        f"User question: {message}\n"
+        f"Risk score: {prediction.overall_score:.1f}/100 ({prediction.severity}).\n"
+        f"AQI context: {location_aqi}.\n"
+        f"User profile: age={profile.age}, conditions={profile.conditions}, medications={profile.medications}.\n"
+        f"Risk reasons: {prediction.risk_reasons}.\n"
+        f"Prevention tips: {prediction.prevention_tips}."
+    )
+    gemini_text = await _gemini_generate(system, prompt)
+    if gemini_text:
+        logger.info("Risk explanation provider: gemini")
+        return gemini_text
+    return None
+
+
 async def _ai_chat_stream(
     message: str,
     profile: Profile,
@@ -316,6 +420,42 @@ async def _ai_chat_stream(
             yield event.delta.text
 
 
+async def _ai_chat_text_with_fallback(
+    message: str,
+    profile: Profile,
+    prediction: RiskPrediction,
+    location_aqi: dict,
+) -> tuple[str | None, str]:
+    if anthropic_client is not None:
+        try:
+            chunks: list[str] = []
+            async for token in _ai_chat_stream(message, profile, prediction, location_aqi):
+                chunks.append(token)
+            text = "".join(chunks).strip()
+            if text:
+                return text, "anthropic"
+        except Exception as exc:
+            logger.warning("Anthropic chat fallback engaged: %s", exc)
+
+    system = (
+        "You are EcoVital Health Advisor. "
+        "Answer based on the user's question and their risk context. "
+        "Be concise, personalized, and actionable."
+    )
+    prompt = (
+        f"Question: {message}\n"
+        f"Current risk: {prediction.overall_score:.1f}/100 ({prediction.severity}).\n"
+        f"AQI details: {location_aqi}.\n"
+        f"Profile: age={profile.age}, conditions={profile.conditions}, medications={profile.medications}.\n"
+        f"Reasons: {prediction.risk_reasons}.\n"
+        f"Prevention tips: {prediction.prevention_tips}."
+    )
+    gemini_text = await _gemini_generate(system, prompt)
+    if gemini_text:
+        return gemini_text, "gemini"
+    return None, "none"
+
+
 @app.exception_handler(RateLimitExceeded)
 async def ratelimit_handler(_: Request, __: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
@@ -332,14 +472,22 @@ async def risk_current(lat: float = Query(...), lng: float = Query(...), user_id
     profile = profiles.get(user_id, Profile(location_lat=lat, location_lng=lng))
     pred = _calc_risk(lat, lng, profile)
     location_aqi = _location_aqi_details(lat, lng)
-    ai_explanation = await _ai_risk_explanation(
-        message="Explain the user's current score and what to do now.",
-        profile=profile,
-        prediction=pred,
-        location_aqi=location_aqi,
-    )
-    if ai_explanation:
-        pred.explanation = ai_explanation
+    try:
+        ai_explanation = await asyncio.wait_for(
+            _ai_risk_explanation_with_fallback(
+                message="Explain the user's current score and what to do now.",
+                profile=profile,
+                prediction=pred,
+                location_aqi=location_aqi,
+            ),
+            timeout=8,
+        )
+        if ai_explanation:
+            pred.explanation = ai_explanation
+    except asyncio.TimeoutError:
+        logger.warning("AI explanation timed out – returning local explanation")
+    except Exception as exc:
+        logger.warning("AI explanation failed – returning local explanation: %s", exc)
     risk_history[user_id].append(
         {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -456,19 +604,17 @@ async def chat_stream(user_id: str = Query(...), message: str = Query(...)):
         profile = profiles.get(user_id, Profile())
         prediction = _calc_risk(profile.location_lat, profile.location_lng, profile)
         location_aqi = _location_aqi_details(profile.location_lat, profile.location_lng)
-        ai_failed = False
-        if anthropic_client is not None:
-            try:
-                async for token in _ai_chat_stream(message, profile, prediction, location_aqi):
-                    yield {"event": "token", "data": token}
-            except Exception as exc:
-                logger.warning("Anthropic chat fallback engaged: %s", exc)
-                ai_failed = True
+        ai_text, provider = await _ai_chat_text_with_fallback(
+            message, profile, prediction, location_aqi
+        )
+        if ai_text:
+            logger.info("Chat provider: %s", provider)
+            for token in ai_text.split(" "):
+                yield {"event": "token", "data": token + " "}
+                await asyncio.sleep(0.02)
         else:
-            ai_failed = True
-
-        if ai_failed:
             text = _chat_reply(message, profile, prediction)
+            logger.info("Chat provider: local_fallback")
             for token in text.split(" "):
                 yield {"event": "token", "data": token + " "}
                 await asyncio.sleep(0.04)
@@ -492,7 +638,7 @@ async def ws_feed(websocket: WebSocket, user_id: str):
 
 @app.on_event("startup")
 async def startup() -> None:
-    global anthropic_client, anthropic_model
+    global anthropic_client, anthropic_model, gemini_enabled, gemini_model, gemini_api_key
     logging.basicConfig(level=logging.INFO)
 
     backend_dir = Path(__file__).resolve().parents[1]
@@ -513,3 +659,12 @@ async def startup() -> None:
         logger.warning(
             "Anthropic disabled: missing/invalid ANTHROPIC_API_KEY. Chat will use local fallback."
         )
+
+    gemini_model = os.getenv("GEMINI_MODEL", gemini_model)
+    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if gemini_api_key:
+        gemini_enabled = True
+        logger.info("Gemini enabled with model: %s", gemini_model)
+    else:
+        gemini_enabled = False
+        logger.warning("Gemini disabled: missing GEMINI_API_KEY.")
