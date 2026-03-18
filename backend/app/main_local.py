@@ -1,14 +1,19 @@
 import asyncio
+import logging
 import math
+import os
 import random
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
+from anthropic import AsyncAnthropic
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from sse_starlette.sse import EventSourceResponse
 from slowapi import Limiter
 from fastapi.responses import JSONResponse
@@ -52,12 +57,18 @@ class RiskPrediction(BaseModel):
     confidence: float
     anomaly_flag: bool
     explanation: str
+    risk_reasons: list[str] = Field(default_factory=list)
+    prevention_tips: list[str] = Field(default_factory=list)
+    user_context: dict = Field(default_factory=dict)
 
 
 profiles: dict[str, Profile] = {}
 alerts: dict[str, Alert] = {}
 risk_history: defaultdict[str, list[dict]] = defaultdict(list)
 community_reports: list[dict] = []
+anthropic_client: AsyncAnthropic | None = None
+anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+logger = logging.getLogger("ecovital.local")
 
 
 def _severity(score: float) -> Literal["low", "medium", "high", "critical"]:
@@ -68,6 +79,49 @@ def _severity(score: float) -> Literal["low", "medium", "high", "critical"]:
     if score >= 30:
         return "medium"
     return "low"
+
+
+def _location_aqi_details(lat: float, lng: float) -> dict:
+    """Generate deterministic pseudo-live AQI details by location."""
+    hour = datetime.now(UTC).hour
+    seed = abs(lat * 37.0 + lng * 13.0) % 100
+    aqi = int(np.clip(40 + seed + 15 * math.sin(hour / 24 * 2 * math.pi), 15, 320))
+    pm25 = round(max(5.0, aqi * 0.55), 1)
+    pm10 = round(max(8.0, aqi * 0.7), 1)
+    o3 = round(max(5.0, aqi * 0.25), 1)
+    no2 = round(max(4.0, aqi * 0.2), 1)
+    if aqi >= 201:
+        category = "very_unhealthy"
+        dominant = "pm25"
+    elif aqi >= 151:
+        category = "unhealthy"
+        dominant = "pm25"
+    elif aqi >= 101:
+        category = "unhealthy_for_sensitive"
+        dominant = "pm10"
+    elif aqi >= 51:
+        category = "moderate"
+        dominant = "o3"
+    else:
+        category = "good"
+        dominant = "no2"
+    recommendation = {
+        "good": "Air quality is good for normal outdoor activity.",
+        "moderate": "Sensitive users should reduce prolonged outdoor exertion.",
+        "unhealthy_for_sensitive": "Sensitive groups should limit outdoor time and use masks.",
+        "unhealthy": "Keep outdoor exposure brief and avoid heavy exertion.",
+        "very_unhealthy": "Avoid outdoor activity unless necessary and use strong protection.",
+    }[category]
+    return {
+        "aqi": aqi,
+        "category": category,
+        "dominant_pollutant": dominant,
+        "pm25": pm25,
+        "pm10": pm10,
+        "o3": o3,
+        "no2": no2,
+        "recommendation": recommendation,
+    }
 
 
 def _calc_risk(lat: float, lng: float, profile: Profile) -> RiskPrediction:
@@ -92,6 +146,34 @@ def _calc_risk(lat: float, lng: float, profile: Profile) -> RiskPrediction:
         "cardiac_risk": float(np.clip(score / 105 + (0.15 if any("heart" in x or "cardiac" in x for x in c) else 0), 0, 1)),
     }
     sev = _severity(score)
+    location_aqi = _location_aqi_details(lat, lng)
+    reasons: list[str] = []
+    if location_aqi["aqi"] >= 151:
+        reasons.append(
+            f"Very high AQI ({location_aqi['aqi']}) with dominant {location_aqi['dominant_pollutant']} is elevating respiratory stress."
+        )
+    elif location_aqi["aqi"] >= 101:
+        reasons.append(
+            f"Moderately unhealthy AQI ({location_aqi['aqi']}) is increasing breathing and circulation load."
+        )
+    if components["asthma_risk"] >= 0.6:
+        reasons.append("Asthma-sensitive risk component is elevated due to pollution interaction.")
+    if components["cardiac_risk"] >= 0.6:
+        reasons.append("Cardiac risk component is elevated because environmental stress can raise heart strain.")
+    if profile.age >= 60:
+        reasons.append("Age-related vulnerability contributes to higher risk sensitivity.")
+    if not reasons:
+        reasons.append("Current environmental and profile signals indicate manageable but non-zero risk.")
+
+    tips = [
+        location_aqi["recommendation"],
+        "Prefer indoor activity during peak pollution periods and keep hydration steady.",
+        "Use a well-fitted mask outdoors when AQI is moderate or worse.",
+    ]
+    if any("asthma" in c.lower() or "copd" in c.lower() for c in profile.conditions):
+        tips.append("Carry rescue inhaler and avoid high-intensity outdoor exertion when symptomatic.")
+    if any("heart" in c.lower() or "cardiac" in c.lower() for c in profile.conditions):
+        tips.append("Avoid strenuous activity in poor air quality and monitor unusual chest discomfort.")
     explanation = (
         f"Your current risk is {score:.0f}/100 ({sev}). "
         "Main drivers are current environmental load and your health profile, so reduce outdoor exertion during peak hours."
@@ -103,6 +185,14 @@ def _calc_risk(lat: float, lng: float, profile: Profile) -> RiskPrediction:
         confidence=0.79,
         anomaly_flag=score > 92,
         explanation=explanation,
+        risk_reasons=reasons[:4],
+        prevention_tips=tips[:5],
+        user_context={
+            "age": profile.age,
+            "conditions": profile.conditions,
+            "location": {"lat": lat, "lng": lng},
+            "aqi": location_aqi,
+        },
     )
 
 
@@ -157,6 +247,75 @@ def _chat_reply(message: str, profile: Profile, prediction: RiskPrediction) -> s
     return f"{risk_prefix} {advice}"
 
 
+async def _ai_risk_explanation(
+    message: str,
+    profile: Profile,
+    prediction: RiskPrediction,
+    location_aqi: dict,
+) -> str | None:
+    if anthropic_client is None:
+        return None
+    system = (
+        "You are EcoVital AI, a preventive health advisor. "
+        "Provide concise, practical, and question-specific guidance in 2-4 sentences. "
+        "Mention the dominant risk reason and one immediate action."
+    )
+    prompt = (
+        f"User question: {message}\n"
+        f"Risk score: {prediction.overall_score:.1f}/100 ({prediction.severity}).\n"
+        f"AQI context: {location_aqi}.\n"
+        f"User profile: age={profile.age}, conditions={profile.conditions}, medications={profile.medications}.\n"
+        f"Risk reasons: {prediction.risk_reasons}.\n"
+        f"Prevention tips: {prediction.prevention_tips}."
+    )
+    try:
+        response = await anthropic_client.messages.create(
+            model=anthropic_model,
+            max_tokens=220,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if response.content:
+            return response.content[0].text.strip()
+    except Exception as exc:
+        logger.warning("Anthropic explanation fallback engaged: %s", exc)
+        return None
+    return None
+
+
+async def _ai_chat_stream(
+    message: str,
+    profile: Profile,
+    prediction: RiskPrediction,
+    location_aqi: dict,
+):
+    if anthropic_client is None:
+        return
+    system = (
+        "You are EcoVital Health Advisor. "
+        "Answer based on the user's question and their risk context. "
+        "Be concise, personalized, and actionable."
+    )
+    prompt = (
+        f"Question: {message}\n"
+        f"Current risk: {prediction.overall_score:.1f}/100 ({prediction.severity}).\n"
+        f"AQI details: {location_aqi}.\n"
+        f"Profile: age={profile.age}, conditions={profile.conditions}, medications={profile.medications}.\n"
+        f"Reasons: {prediction.risk_reasons}.\n"
+        f"Prevention tips: {prediction.prevention_tips}."
+    )
+    stream = await anthropic_client.messages.create(
+        model=anthropic_model,
+        max_tokens=260,
+        stream=True,
+        system=system,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    async for event in stream:
+        if event.type == "content_block_delta" and getattr(event.delta, "text", ""):
+            yield event.delta.text
+
+
 @app.exception_handler(RateLimitExceeded)
 async def ratelimit_handler(_: Request, __: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
@@ -172,6 +331,15 @@ async def health(request: Request):
 async def risk_current(lat: float = Query(...), lng: float = Query(...), user_id: str = Query(...)):
     profile = profiles.get(user_id, Profile(location_lat=lat, location_lng=lng))
     pred = _calc_risk(lat, lng, profile)
+    location_aqi = _location_aqi_details(lat, lng)
+    ai_explanation = await _ai_risk_explanation(
+        message="Explain the user's current score and what to do now.",
+        profile=profile,
+        prediction=pred,
+        location_aqi=location_aqi,
+    )
+    if ai_explanation:
+        pred.explanation = ai_explanation
     risk_history[user_id].append(
         {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -259,6 +427,7 @@ class CommunityReport(BaseModel):
 
 @app.post("/api/map/report")
 async def map_report(body: CommunityReport):
+    location_aqi = _location_aqi_details(body.lat, body.lng)
     community_reports.append(
         {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -266,9 +435,19 @@ async def map_report(body: CommunityReport):
             "lng": body.lng,
             "symptoms": body.symptoms,
             "severity": body.severity,
+            "location_aqi": location_aqi,
         }
     )
-    return {"success": True, "message": "Thank you for reporting"}
+    return {
+        "success": True,
+        "message": "Thank you for reporting",
+        "location_aqi": location_aqi,
+    }
+
+
+@app.get("/api/location/aqi")
+async def location_aqi(lat: float = Query(...), lng: float = Query(...)):
+    return _location_aqi_details(lat, lng)
 
 
 @app.get("/api/chat/stream")
@@ -276,10 +455,23 @@ async def chat_stream(user_id: str = Query(...), message: str = Query(...)):
     async def event_generator():
         profile = profiles.get(user_id, Profile())
         prediction = _calc_risk(profile.location_lat, profile.location_lng, profile)
-        text = _chat_reply(message, profile, prediction)
-        for token in text.split(" "):
-            yield {"event": "token", "data": token + " "}
-            await asyncio.sleep(0.04)
+        location_aqi = _location_aqi_details(profile.location_lat, profile.location_lng)
+        ai_failed = False
+        if anthropic_client is not None:
+            try:
+                async for token in _ai_chat_stream(message, profile, prediction, location_aqi):
+                    yield {"event": "token", "data": token}
+            except Exception as exc:
+                logger.warning("Anthropic chat fallback engaged: %s", exc)
+                ai_failed = True
+        else:
+            ai_failed = True
+
+        if ai_failed:
+            text = _chat_reply(message, profile, prediction)
+            for token in text.split(" "):
+                yield {"event": "token", "data": token + " "}
+                await asyncio.sleep(0.04)
         yield {"event": "done", "data": "[DONE]"}
 
     return EventSourceResponse(event_generator())
@@ -296,3 +488,28 @@ async def ws_feed(websocket: WebSocket, user_id: str):
             await asyncio.sleep(8)
     except WebSocketDisconnect:
         return
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    global anthropic_client, anthropic_model
+    logging.basicConfig(level=logging.INFO)
+
+    backend_dir = Path(__file__).resolve().parents[1]
+    root_dir = backend_dir.parent
+    load_dotenv(root_dir / ".env", override=False)
+    load_dotenv(backend_dir / ".env", override=False)
+    # Local dev fallback if user populated only .env.example.
+    load_dotenv(root_dir / ".env.example", override=False)
+    load_dotenv(backend_dir / ".env.example", override=False)
+
+    anthropic_model = os.getenv("ANTHROPIC_MODEL", anthropic_model)
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if api_key.startswith("sk-ant-"):
+        anthropic_client = AsyncAnthropic(api_key=api_key)
+        logger.info("Anthropic enabled with model: %s", anthropic_model)
+    else:
+        anthropic_client = None
+        logger.warning(
+            "Anthropic disabled: missing/invalid ANTHROPIC_API_KEY. Chat will use local fallback."
+        )

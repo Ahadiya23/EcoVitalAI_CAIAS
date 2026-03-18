@@ -4,6 +4,8 @@ import { DemoBanner } from "../components/DemoBanner";
 import { ImpactBanner } from "../components/ImpactBanner";
 import { ShareCard } from "../components/ShareCard";
 import { useForecast } from "../hooks/useForecast";
+import { useLocationAqi } from "../hooks/useLocationAqi";
+import { useProfile } from "../hooks/useProfile";
 import { useRiskScore } from "../hooks/useRiskScore";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useAppStore } from "../store/useAppStore";
@@ -27,6 +29,8 @@ export function DashboardPage() {
 
   const risk = useRiskScore(lat, lng, userId);
   const forecast = useForecast(lat, lng, userId);
+  const locationAqi = useLocationAqi(lat, lng);
+  const { profile } = useProfile(userId);
 
   const onSocketMessage = useCallback((message: any) => setCurrentRisk(message), [setCurrentRisk]);
   useWebSocket<any>(`ws://localhost:8000/ws/risk-feed/${userId}`, onSocketMessage);
@@ -91,7 +95,29 @@ export function DashboardPage() {
         <section className="space-y-3 rounded-xl border bg-white p-4 md:col-span-3 dark:border-slate-800 dark:bg-slate-900">
           <h2 className="font-semibold">Today's health outlook</h2>
           <p className="text-sm">{risk.data?.explanation ?? "Loading AI summary..."}</p>
-          <ShareCard score={score} severity={risk.data?.severity ?? "low"} topRiskFactor="Air quality" />
+          <div className="rounded-lg border p-3 text-sm">
+            <p className="font-medium">AQI details for your location</p>
+            <p className="mt-1">
+              AQI: <strong>{locationAqi.data?.aqi ?? "--"}</strong> ({locationAqi.data?.category ?? "loading"})
+            </p>
+            <p className="mt-1 text-xs text-slate-500">
+              PM2.5 {locationAqi.data?.pm25 ?? "--"} | PM10 {locationAqi.data?.pm10 ?? "--"} | O3 {locationAqi.data?.o3 ?? "--"} | NO2 {locationAqi.data?.no2 ?? "--"}
+            </p>
+          </div>
+          <ShareCard
+            score={score}
+            severity={risk.data?.severity ?? "low"}
+            topRiskFactor="Air quality"
+            aqiSummary={
+              locationAqi.data
+                ? `${locationAqi.data.aqi} (${locationAqi.data.category.replaceAll("_", " ")})`
+                : "Fetching..."
+            }
+            age={(profile.data as { age?: number } | undefined)?.age}
+            symptoms={(profile.data as { conditions?: string[] } | undefined)?.conditions ?? []}
+            reasons={risk.data?.risk_reasons ?? []}
+            preventionTips={risk.data?.prevention_tips ?? []}
+          />
         </section>
       </div>
       <ImpactBanner reportCount={2834} hoursAhead={24} />

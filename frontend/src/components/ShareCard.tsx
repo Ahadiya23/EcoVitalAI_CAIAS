@@ -5,9 +5,23 @@ interface Props {
   score: number;
   severity: string;
   topRiskFactor: string;
+  aqiSummary?: string;
+  age?: number;
+  symptoms?: string[];
+  reasons?: string[];
+  preventionTips?: string[];
 }
 
-export function ShareCard({ score, severity, topRiskFactor }: Props) {
+export function ShareCard({
+  score,
+  severity,
+  topRiskFactor,
+  aqiSummary = "AQI data pending",
+  age,
+  symptoms = [],
+  reasons = [],
+  preventionTips = [],
+}: Props) {
   const ref = useRef<HTMLDivElement>(null);
 
   const onShare = async () => {
@@ -30,6 +44,21 @@ export function ShareCard({ score, severity, topRiskFactor }: Props) {
         <p className="mt-3 text-6xl font-semibold">{Math.round(score)}</p>
         <p className="mt-1 text-xl capitalize">{severity}</p>
         <p className="mt-3 text-sm">Top factor: {topRiskFactor}</p>
+        <p className="mt-1 text-sm">Location AQI: {aqiSummary}</p>
+        <p className="mt-1 text-sm">Age: {age ?? "N/A"}</p>
+        <p className="mt-1 text-sm">Symptoms/conditions: {symptoms.length ? symptoms.join(", ") : "Not provided"}</p>
+        <p className="mt-2 text-xs font-semibold text-slate-700">Why this score</p>
+        <ul className="mt-1 list-disc space-y-1 pl-4 text-xs text-slate-700">
+          {(reasons.length ? reasons : ["Risk reasons loading..."]).slice(0, 3).map((reason, idx) => (
+            <li key={idx}>{reason}</li>
+          ))}
+        </ul>
+        <p className="mt-2 text-xs font-semibold text-slate-700">How to reduce risk</p>
+        <ul className="mt-1 list-disc space-y-1 pl-4 text-xs text-slate-700">
+          {(preventionTips.length ? preventionTips : ["Prevention guidance loading..."]).slice(0, 3).map((tip, idx) => (
+            <li key={idx}>{tip}</li>
+          ))}
+        </ul>
         <p className="mt-3 text-xs text-slate-600">{new Date().toDateString()}</p>
         <p className="mt-1 text-sm">Climate-aware personal health intelligence.</p>
       </div>

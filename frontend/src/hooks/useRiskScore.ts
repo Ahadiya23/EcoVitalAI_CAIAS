@@ -13,6 +13,12 @@ export function useRiskScore(lat: number, lng: number, userId: string) {
         severity: "low" | "medium" | "high" | "critical";
         component_scores: Record<string, number>;
         explanation: string;
+        risk_reasons?: string[];
+        prevention_tips?: string[];
+        user_context?: {
+          age?: number;
+          conditions?: string[];
+        };
       };
     },
     enabled: Boolean(userId)

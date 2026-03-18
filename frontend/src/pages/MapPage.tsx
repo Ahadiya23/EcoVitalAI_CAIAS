@@ -21,8 +21,10 @@ export function MapPage() {
   }, [points, showHeat]);
 
   const submitReport = async () => {
-    await apiClient.post("/api/map/report", { lat: 12.97, lng: 77.59, symptoms, severity });
-    alert("Report submitted. Thank you.");
+    const { data } = await apiClient.post("/api/map/report", { lat: 12.97, lng: 77.59, symptoms, severity });
+    const aqi = data?.location_aqi?.aqi;
+    const category = data?.location_aqi?.category?.replaceAll("_", " ");
+    alert(`Report submitted. Thank you.\nNearby AQI: ${aqi} (${category}).`);
   };
 
   return (
